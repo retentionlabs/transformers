@@ -48,26 +48,29 @@
 #
 # Licensed under Apache License, Version 2.0
 from collections import defaultdict
-from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
-import torch.utils.checkpoint
 from torch import nn
-from torch.nn import CrossEntropyLoss
-from torch.utils._pytree import tree_map
+import torch.utils.checkpoint
+import torch.nn.functional as F
 
-from transformers import PretrainedConfig
-from transformers.activations import ACT2FN
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
+from ...utils.scan_ops import associative_scan
+from ...cache_utils import Cache, DynamicCache
+from ...configuration_utils import PretrainedConfig
+from ...modeling_outputs import (
+    BaseModelOutput,
+    CausalLMOutput,
 )
-from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import ModelOutput, logging
-from transformers.utils.import_utils import is_causal_conv1d_available
-
+from ...modeling_utils import PreTrainedModel
+from ..llama.modeling_llama import (
+    LlamaMLP,
+    LlamaRMSNorm,
+    LlamaRotaryEmbedding,
+    apply_rotary_pos_emb
+)
+from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
+from ...utils.import_utils import is_causal_conv1d_available
 if is_causal_conv1d_available():
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 else:
@@ -76,35 +79,8 @@ else:
 
 logger = logging.get_logger(__name__)
 
-TTT_STANDARD_CONFIGS = {
-    "125m": {
-        "hidden_size": 768,
-        "intermediate_size": 2048,
-        "num_hidden_layers": 12,
-        "num_attention_heads": 12,
-    },
-    "350m": {
-        "hidden_size": 1024,
-        "intermediate_size": 2736,
-        "num_hidden_layers": 24,
-        "num_attention_heads": 16,
-    },
-    "760m": {
-        "hidden_size": 1536,
-        "intermediate_size": 4096,
-        "num_hidden_layers": 24,
-        "num_attention_heads": 16,
-    },
-    "1b": {
-        "hidden_size": 2048,
-        "intermediate_size": 5504,
-        "num_hidden_layers": 24,
-        "num_attention_heads": 32,
-    },
-}
 
-
-class TTTConfig(PretrainedConfig):
+class TTTLinearConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`TTTModel`]. It is used to instantiate an TTT
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
@@ -171,29 +147,29 @@ class TTTConfig(PretrainedConfig):
             experimental feature, subject to breaking API changes in future versions.
         use_gate (`bool`, *optional*, defaults to `False`): whether use gating in Mamba backbone
         share_qk (`bool`, *optional*, defaults to `False`): whether share Q/K projection matrix
-        ttt_layer_type (`str`, *optional*, defaults to `"linear"`): ttt block type, "linear" or "mlp", stands for TTT-Linear and TTT-MLP
         ttt_base_lr (`float`, *optional*, defaults to 1.0): base learning rate for TTT learner
+        chunk_size (`int`, *optional*, defaults to 16): chunk size (mini-batch size) for TTT learner
         pre_conv (`bool`, *optional*, defaults to `False`): whether use conv before TTT
         conv_kernel (`int`, *optional*, defaults to 4): kernel size of the conv layer
         scan_checkpoint_group_size (`int`, *optional*, defaults to 0):
             gradient checkpoint group size on seq dimension, 0 means no checkpointing.
-            In JAX implementation, we set it 4, which means we group 4 mini-batches together in 1 gradient checkpointg to save memory.
+            In JAX implementation, we set it 4, which means we group 4 chunks together in 1 gradient checkpointg to save memory.
 
 
     ```python
-    >>> from . import TTTModel, TTTConfig
+    >>> from transformers import TTTLinearModel, TTTLinearConfig
 
     >>> # Initializing a TTT ttt-1b style configuration
-    >>> configuration = TTTConfig()
+    >>> configuration = TTTLinearConfig()
 
     >>> # Initializing a model from the ttt-1b style configuration
-    >>> model = TTTModel(configuration)
+    >>> model = TTTLinearModel(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```"""
 
-    model_type = "ttt"
+    model_type = "ttt_linear"
 
     def __init__(
         self,
@@ -215,9 +191,8 @@ class TTTConfig(PretrainedConfig):
         rope_theta=10000.0,
         use_gate=False,
         share_qk=False,
-        ttt_layer_type="linear",
         ttt_base_lr=1.0,
-        mini_batch_size=16,
+        chunk_size=16,
         pre_conv=False,
         conv_kernel=4,
         scan_checkpoint_group_size=0,
@@ -239,9 +214,8 @@ class TTTConfig(PretrainedConfig):
 
         self.use_gate = use_gate
         self.share_qk = share_qk
-        self.ttt_layer_type = ttt_layer_type
         self.ttt_base_lr = ttt_base_lr
-        self.mini_batch_size = mini_batch_size
+        self.chunk_size = chunk_size
 
         self.pre_conv = pre_conv
         self.conv_kernel = conv_kernel
@@ -256,94 +230,11 @@ class TTTConfig(PretrainedConfig):
         )
 
 
-########################
-### Backbone Modules ###
-########################
+class TTTRMSNorm(LlamaRMSNorm):
+    pass
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def permute_qk(q, k):
-    # NOTE: EasyLM and transformers use different method to compute rotary emebdding
-    # we manually reorder the dim here to match our JAX implementation
-    # which may not be optimal for speed
-    # reference: https://github.com/young-geng/EasyLM/blob/981a2ed9630f44258a94b6f44dff2b7bd203ae8d/EasyLM/models/llama/convert_hf_to_easylm.py#L33
-    bsz, num_head, seq_len, head_dim = q.shape
-    q = q.reshape(bsz, num_head, seq_len, head_dim // 2, 2).transpose(3, 4).reshape(bsz, num_head, seq_len, head_dim)
-    k = k.reshape(bsz, num_head, seq_len, head_dim // 2, 2).transpose(3, 4).reshape(bsz, num_head, seq_len, head_dim)
-
-    return q, k
-
-
-def undo_permute_qk(q, k):
-    # NOTE: EasyLM and transformers use different method to compute rotary emebdding
-    # we manually undo the reorder the dim here to match our JAX implementation
-    # which may not be optimal for speed
-    # reference: https://github.com/young-geng/EasyLM/blob/981a2ed9630f44258a94b6f44dff2b7bd203ae8d/EasyLM/models/llama/convert_hf_to_easylm.py#L33
-    bsz, num_head, seq_len, head_dim = q.shape
-    q = q.reshape(bsz, num_head, seq_len, 2, head_dim // 2).transpose(3, 4).reshape(bsz, num_head, seq_len, head_dim)
-    k = k.reshape(bsz, num_head, seq_len, 2, head_dim // 2).transpose(3, 4).reshape(bsz, num_head, seq_len, head_dim)
-
-    return q, k
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`, *optional*):
-            Deprecated and unused.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-
-
-class SwiGluMLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-
+class TTTSwiGluMLP(LlamaMLP):
     def forward(self, x):
         if self.config.pretraining_tp > 1:
             slice = self.intermediate_size // self.config.pretraining_tp
@@ -371,47 +262,29 @@ class SwiGluMLP(nn.Module):
         return down_proj
 
 
-class RotaryEmbedding(nn.Module):
+class TTTRotaryEmbedding(LlamaRotaryEmbedding):
     def __init__(
-        self,
-        dim,
-        max_position_embeddings=16,
-        base=10000,
-        device=None,
-        scaling_factor=1.0,
+        self, dim: int, max_position_embeddings: int = 16, base: int = 10000,
+        device: Optional[torch.device] = None, attention_scaling: Union[float, int] = 1,
     ):
-        super().__init__()
-        self.scaling_factor = scaling_factor
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
+        super(nn.Module, self).__init__()
+        self.rope_type = "default"  # Keep compatibility with LlamaRotaryEmbedding
+        self.original_max_seq_len = self.max_seq_len_cached = max_position_embeddings
+        self.config = None  # Keep compatibility with LlamaRotaryEmbedding
+
+        self.dim, self.base, self.attention_scaling = dim, base, attention_scaling
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    @torch.no_grad()
-    def forward(self, x, position_ids):
-        # x: [bs, num_attention_heads, seq_len, head_size]
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
-        # Force float32 since bfloat16 loses precision on long contexts
-        # See https://github.com/huggingface/transformers/pull/29285
-        device_type = x.device.type
-        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        self.original_inv_freq = self.inv_freq  # Keep compatibility with LlamaRotaryEmbedding
 
 
-class Conv(nn.Module):
+class TTTCausalConv1d(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = TTTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.conv = nn.Conv1d(
             config.hidden_size,
             config.hidden_size,
@@ -477,6 +350,30 @@ class Conv(nn.Module):
 #########################
 
 
+def permute_qk(q, k):
+    # NOTE: EasyLM and transformers use different method to compute rotary emebdding
+    # we manually reorder the dim here to match our JAX implementation
+    # which may not be optimal for speed
+    # reference: https://github.com/young-geng/EasyLM/blob/981a2ed9630f44258a94b6f44dff2b7bd203ae8d/EasyLM/models/llama/convert_hf_to_easylm.py#L33
+    bsz, num_head, seq_len, head_dim = q.shape
+    q = q.reshape(bsz, num_head, seq_len, head_dim // 2, 2).transpose(3, 4).reshape(bsz, num_head, seq_len, head_dim)
+    k = k.reshape(bsz, num_head, seq_len, head_dim // 2, 2).transpose(3, 4).reshape(bsz, num_head, seq_len, head_dim)
+
+    return q, k
+
+
+def undo_permute_qk(q, k):
+    # NOTE: EasyLM and transformers use different method to compute rotary emebdding
+    # we manually undo the reorder the dim here to match our JAX implementation
+    # which may not be optimal for speed
+    # reference: https://github.com/young-geng/EasyLM/blob/981a2ed9630f44258a94b6f44dff2b7bd203ae8d/EasyLM/models/llama/convert_hf_to_easylm.py#L33
+    bsz, num_head, seq_len, head_dim = q.shape
+    q = q.reshape(bsz, num_head, seq_len, 2, head_dim // 2).transpose(3, 4).reshape(bsz, num_head, seq_len, head_dim)
+    k = k.reshape(bsz, num_head, seq_len, 2, head_dim // 2).transpose(3, 4).reshape(bsz, num_head, seq_len, head_dim)
+
+    return q, k
+
+
 def scan(f, init, xs, out, checkpoint_group=0):
     """Minic jax.lax.scan function."""
     carry = init
@@ -508,7 +405,7 @@ def scan(f, init, xs, out, checkpoint_group=0):
 
 
 def ln_fwd(x, gamma, beta, eps=1e-6):
-    "Batch forward for LayerNorm."
+    """Batch forward for LayerNorm."""
 
     # Mean and variance computation
     mu = x.mean(dim=-1, keepdim=True)
@@ -525,7 +422,7 @@ def ln_fwd(x, gamma, beta, eps=1e-6):
 
 
 def ln_fused_l2_bwd(x, l2_target, gamma, beta, eps=1e-6):
-    "Batch backward for LayerNorm fused with L2 loss."
+    """Batch backward for LayerNorm fused with L2 loss."""
     D = x.shape[-1]
 
     # Mean and variance computation
@@ -571,16 +468,15 @@ class TTTCache:
 
     Attributes:
         seqlen_offset: int
-        mini_batch_size: int
+        chunk_size: int
         params_dict: Dict[str, Dict[int, torch.Tensor]]  *_states, *_grad -> # layer_idx -> [batch_size, ...]
         conv_states_dic: Dict[str, Dict[int, torch.Tensor]]  *_states -> # layer_idx -> [batch_size, ...]
-
     """
 
     def __init__(self, model, batch_size: int):
         config = model.config
         self.seqlen_offset = 0
-        self.mini_batch_size = config.mini_batch_size
+        self.chunk_size = config.chunk_size
 
         self.ttt_params_dict = defaultdict(dict)
         if "linear" in config.ttt_layer_type:
@@ -647,7 +543,7 @@ class TTTCache:
 
 
 class TTTBase(nn.Module):
-    def __init__(self, config: TTTConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: TTTLinearConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -662,13 +558,13 @@ class TTTBase(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.width // self.num_heads
-        self.mini_batch_size = config.mini_batch_size
+        self.chunk_size = config.chunk_size
 
         # token_idx is a scale factor that scale the summation in Eqn. 4
-        token_idx = 1.0 / torch.arange(1, self.mini_batch_size + 1)
+        token_idx = 1.0 / torch.arange(1, self.chunk_size + 1)
         self.register_buffer("token_idx", token_idx, persistent=False)
         # make the scale factor learnable
-        self.learnable_token_idx = nn.Parameter(torch.zeros((self.mini_batch_size,)))
+        self.learnable_token_idx = nn.Parameter(torch.zeros((self.chunk_size,)))
 
         self.share_qk = config.share_qk
         self.conv_kernel = config.conv_kernel
@@ -714,9 +610,9 @@ class TTTBase(nn.Module):
 
     def _init_rope(self):
         self.rope_theta = self.config.rope_theta
-        self.rotary_emb = RotaryEmbedding(
+        self.rotary_emb = TTTRotaryEmbedding(
             self.head_dim,
-            max_position_embeddings=self.mini_batch_size,
+            max_position_embeddings=self.chunk_size,
             base=self.rope_theta,
         )
 
@@ -871,7 +767,7 @@ class TTTBase(nn.Module):
         XV = XV.reshape(B, self.num_heads, L // mini_batch_size, mini_batch_size, self.head_dim)
 
         if cache_params is not None:
-            mini_batch_step_offset = cache_params.seqlen_offset % self.mini_batch_size
+            mini_batch_step_offset = cache_params.seqlen_offset % self.chunk_size
         else:
             mini_batch_step_offset = 0
         token_eta, ttt_lr_eta = self.get_eta(X, mini_batch_step_offset, mini_batch_size)
@@ -904,8 +800,8 @@ class TTTBase(nn.Module):
         cache_params: Optional[TTTCache] = None,
     ):
         B, L = hidden_states.shape[:2]
-        reminder_len = L % self.mini_batch_size
-        num_mini_batch = L // self.mini_batch_size
+        reminder_len = L % self.chunk_size
+        num_mini_batch = L // self.chunk_size
         last_mini_batch_params_dict = None
 
         XQ, XK, XV = self.get_qkv_projections(hidden_states, cache_params=cache_params)
@@ -915,7 +811,7 @@ class TTTBase(nn.Module):
         XK = XK.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         XV = XV.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(XV, position_ids % self.mini_batch_size)
+        cos, sin = self.rotary_emb(XV, position_ids % self.chunk_size)
 
         # permute_qk and undo_permute_qk is just for aligning pytorch with jax pre-training
         XQ, XK = permute_qk(XQ, XK)
@@ -928,14 +824,14 @@ class TTTBase(nn.Module):
         # we will need the last_mini_batch_params_dict to continue TTT learning
         if num_mini_batch > 0:
             inputs = {
-                "XQ": XQ[:, :, : num_mini_batch * self.mini_batch_size],
-                "XK": XK[:, :, : num_mini_batch * self.mini_batch_size],
-                "XV": XV[:, :, : num_mini_batch * self.mini_batch_size],
-                "X": hidden_states[:, : num_mini_batch * self.mini_batch_size],
+                "XQ": XQ[:, :, : num_mini_batch * self.chunk_size],
+                "XK": XK[:, :, : num_mini_batch * self.chunk_size],
+                "XV": XV[:, :, : num_mini_batch * self.chunk_size],
+                "X": hidden_states[:, : num_mini_batch * self.chunk_size],
             }
             output_mod, last_mini_batch_params_dict = self.ttt(
-                self.get_ttt_inputs(inputs, self.mini_batch_size, cache_params),
-                mini_batch_size=self.mini_batch_size,
+                self.get_ttt_inputs(inputs, self.chunk_size, cache_params),
+                mini_batch_size=self.chunk_size,
                 last_mini_batch_params_dict=last_mini_batch_params_dict,
                 cache_params=cache_params,
             )
@@ -965,7 +861,7 @@ class TTTBase(nn.Module):
 
 
 class TTTLinear(TTTBase):
-    def __init__(self, config: TTTConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: TTTLinearConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
         # TTT model initialization for TTT-Linear
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
@@ -979,7 +875,7 @@ class TTTLinear(TTTBase):
         cache_params: Optional[TTTCache] = None,
     ):
         if mini_batch_size is None:
-            mini_batch_size = self.mini_batch_size
+            mini_batch_size = self.chunk_size
 
         # in this case, we are decoding
         if last_mini_batch_params_dict is None and cache_params is not None:
@@ -996,7 +892,7 @@ class TTTLinear(TTTBase):
         # for prefilling, we will always use dual form for faster computation
         # we need to use primal form if mini_batch_size is not a multiple of self.mini_batch_size
         # since we need store the gradient for the next mini-batch computation
-        use_dual_form = cache_params is None or mini_batch_size % self.mini_batch_size == 0
+        use_dual_form = cache_params is None or mini_batch_size % self.chunk_size == 0
 
         def compute_mini_batch(params_dict, inputs):
             # [B, nh, f, f], nh=num_heads, f=head_dim
@@ -1119,7 +1015,7 @@ class TTTLinear(TTTBase):
 
 
 class TTTMLP(TTTBase):
-    def __init__(self, config: TTTConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: TTTLinearConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
         # TTT model initialization for TTT-MLP
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, 4 * self.head_dim)))
@@ -1135,7 +1031,7 @@ class TTTMLP(TTTBase):
         cache_params: Optional[TTTCache] = None,
     ):
         if mini_batch_size is None:
-            mini_batch_size = self.mini_batch_size
+            mini_batch_size = self.chunk_size
 
         # in this case, we are decoding
         if last_mini_batch_params_dict is None and cache_params is not None:
@@ -1151,7 +1047,7 @@ class TTTMLP(TTTBase):
         # for prefilling, we will always use dual form for faster computation
         # we need to use primal form if mini_batch_size is not a multiple of self.mini_batch_size
         # since we need store the gradient for the next mini-batch computation
-        use_dual_form = cache_params is None or mini_batch_size % self.mini_batch_size == 0
+        use_dual_form = cache_params is None or mini_batch_size % self.chunk_size == 0
 
         def compute_mini_batch(params_dict, inputs):
             # [B, nh, f, 4f]
@@ -1317,13 +1213,8 @@ class TTTMLP(TTTBase):
         return XQW_batch, batch_params_dict
 
 
-################################
-### E2E Architecture Modules ###
-################################
-
-
 class Block(nn.Module):
-    def __init__(self, config: TTTConfig, layer_idx: int):
+    def __init__(self, config: TTTLinearConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.pre_conv = config.pre_conv
@@ -1337,12 +1228,12 @@ class Block(nn.Module):
 
         self.seq_modeling_block = ttt_layer(config=config, layer_idx=layer_idx)
 
-        self.mlp = SwiGluMLP(config)
+        self.mlp = TTTSwiGluMLP(config)
         if self.pre_conv:
-            self.conv = Conv(config, layer_idx)
+            self.conv = TTTCausalConv1d(config, layer_idx)
 
-        self.seq_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.seq_norm = TTTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = TTTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layer_idx = layer_idx
 
     def forward(
@@ -1380,7 +1271,7 @@ class Block(nn.Module):
 
 
 class TTTPreTrainedModel(PreTrainedModel):
-    config_class = TTTConfig
+    config_class = TTTLinearConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["Block"]
@@ -1397,8 +1288,7 @@ class TTTPreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
 
-@dataclass
-class TTTOutput(ModelOutput):
+class TTTOutput(BaseModelOutput):
     """
     Class for the TTT model outputs.
 
@@ -1415,8 +1305,7 @@ class TTTOutput(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
 
 
-@dataclass
-class TTTCausalLMOutput(ModelOutput):
+class TTTCausalLMOutput(CausalLMOutput):
     """
     Base class for causal language model (or autoregressive) outputs.
 
@@ -1441,17 +1330,17 @@ class TTTModel(TTTPreTrainedModel):
     Decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`Block`]
 
     Args:
-        config: TTTConfig
+        config: TTTLinearConfig
     """
 
-    def __init__(self, config: TTTConfig):
+    def __init__(self, config: TTTLinearConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = TTTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -1679,7 +1568,7 @@ class TTTForCausalLM(TTTPreTrainedModel):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
+            loss_fct = nn.CrossEntropyLoss()
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
