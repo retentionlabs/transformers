@@ -55,8 +55,8 @@ from torch import nn
 import torch.utils.checkpoint
 import torch.nn.functional as F
 
-from ...utils.scan_ops import associative_scan
 from ...cache_utils import Cache, DynamicCache
+from ...utils.scan_ops import scan, associative_scan
 from ...configuration_utils import PretrainedConfig
 from ...modeling_outputs import (
     BaseModelOutput,
@@ -372,36 +372,6 @@ def undo_permute_qk(q, k):
     k = k.reshape(bsz, num_head, seq_len, 2, head_dim // 2).transpose(3, 4).reshape(bsz, num_head, seq_len, head_dim)
 
     return q, k
-
-
-def scan(f, init, xs, out, checkpoint_group=0):
-    """Minic jax.lax.scan function."""
-    carry = init
-    if isinstance(xs, dict):
-        num_items = len(next(iter(xs.values())))
-    else:
-        num_items = len(xs[0])
-
-    def scan_fn(carry, i_start, i_end):
-        for i in range(i_start, i_end):
-            if isinstance(xs, dict):
-                x = {key: tensor[i] for key, tensor in xs.items()}
-            else:
-                x = [x[i] for x in xs]
-            carry, y = f(carry, x)
-            out[i] = y
-        return carry
-
-    if checkpoint_group > 0:
-        ckpt_every_n = num_items // checkpoint_group
-        for k in range(0, num_items, ckpt_every_n):
-            carry = torch.utils.checkpoint.checkpoint(
-                scan_fn, carry, k, min(k + ckpt_every_n, num_items), use_reentrant=False
-            )
-    else:
-        carry = scan_fn(carry, 0, num_items)
-
-    return carry, out
 
 
 def ln_fwd(x, gamma, beta, eps=1e-6):
@@ -894,6 +864,7 @@ class TTTLinear(TTTBase):
         # since we need store the gradient for the next mini-batch computation
         use_dual_form = cache_params is None or mini_batch_size % self.chunk_size == 0
 
+        @torch.compile(mode="max-autotune")
         def compute_mini_batch(params_dict, inputs):
             # [B, nh, f, f], nh=num_heads, f=head_dim
             W1_init = params_dict["W1_states"]
