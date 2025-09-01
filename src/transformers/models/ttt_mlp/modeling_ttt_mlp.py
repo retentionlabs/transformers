@@ -54,6 +54,7 @@
 #
 # Licensed under Apache License, Version 2.0
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Union, Unpack
 
@@ -171,7 +172,7 @@ class TTTDynamicLearningGate(nn.Module):
         return token_eta, learning_rate_eta
 
 
-class AdaptiveLinear(nn.Module):
+class TTTAdaptiveLinear(nn.Module):
     def __init__(self, num_heads: int, in_features: int, out_features: int, bias: bool = True):
         super().__init__()
         self.use_bias = bias
@@ -240,8 +241,8 @@ class TTTMLPMemory(nn.Module):
     @property
     def struct_detail(self):
         return [
-            self.AdaptiveLinear(self.num_heads, self.head_dim, 4 * self.head_dim),
-            self.AdaptiveLinear(self.num_heads, 4 * self.head_dim, self.head_dim),
+            TTTAdaptiveLinear(self.num_heads, self.head_dim, 4 * self.head_dim),
+            TTTAdaptiveLinear(self.num_heads, 4 * self.head_dim, self.head_dim),
         ]
 
     def __init__(
@@ -283,6 +284,14 @@ class TTTMLPMemory(nn.Module):
                     raise ValueError
             except ValueError:
                 raise ValueError(f"Invalid memory state dict key {key} found.")
+
+    @contextmanager
+    def detached_state(self, batch_size: int):
+        init_params = self.detach(batch_size)
+        try:
+            yield init_params
+        finally:
+            self.attach()
 
     @property
     def detached(self):
@@ -625,25 +634,26 @@ class TTTMLPAdaptation(nn.Module):
         stacked_qkv = torch.stack([XQ, XK, XV], dim=2)
         xs = stacked_qkv.permute(3, 0, 1, 2, 4, 5)
 
-        # input: [B, num_heads, num_mini_batch, mini_batch_size, f] -> [num_mini_batch, B, num_heads, mini_batch_size, f]
-        # output_hidden_states: [num_mini_batch, B, num_heads, mini_batch_size, head_dim]
-        init_params = self.neural_memory.detach(B)
-        if cache_params is not None:
-            init_params.load_state_dict(cache_params[self.layer_idx])
-        scan_params = dict(combine_fn=self.step, init=init_params, xs=xs)
-        try:
-            last_params, output_hidden_states = scan(
-                **scan_params, checkpoint_group=self.config.scan_checkpoint_group_size if self.training else 0
-            )
-        except TypeError:  # Using PyTorch official scan
-            last_params, output_hidden_states = scan(**scan_params)
-        output_hidden_states = output_hidden_states[
-            :, :, :, 0, :, :
-        ]  # [num_mini_batch, B, num_heads, chunk_size, head_dim]
+        with self.neural_memory.detached_state(B) as init_params:
+            if cache_params is not None:
+                init_params.load_state_dict(cache_params[self.layer_idx])
 
-        # [B, num_heads, L, C]
-        if cache_params is not None:
-            cache_params.update(last_params.state_dict, self.layer_idx)
+            # input: [B, num_heads, num_mini_batch, mini_batch_size, f] -> [num_mini_batch, B, num_heads, mini_batch_size, f]
+            # output_hidden_states: [num_mini_batch, B, num_heads, mini_batch_size, head_dim]
+            scan_params = dict(combine_fn=self.step, init=init_params, xs=xs)
+            try:
+                last_params, output_hidden_states = scan(
+                    **scan_params, checkpoint_group=self.config.scan_checkpoint_group_size if self.training else 0
+                )
+            except TypeError:  # Using PyTorch official scan
+                last_params, output_hidden_states = scan(**scan_params)
+            output_hidden_states = output_hidden_states[
+                :, :, :, 0, :, :
+            ]  # [num_mini_batch, B, num_heads, chunk_size, head_dim]
+
+            # [B, num_heads, L, C]
+            if cache_params is not None:
+                cache_params.update(last_params.state_dict, self.layer_idx)
 
         # [num_mini_batch, B, num_heads, mini_batch_size, head_dim] -> [B, num_mini_batch, mini_batch_size, num_heads, head_dim]
         output_hidden_states = output_hidden_states.permute(1, 0, 3, 2, 4)
@@ -652,7 +662,7 @@ class TTTMLPAdaptation(nn.Module):
 
         output_hidden_states = self.post_norm(output_hidden_states)
         output_hidden_states = self.o_proj(output_hidden_states)
-        self.neural_memory.attach()
+
         return output_hidden_states
 
 
@@ -792,6 +802,12 @@ class TTTMLPLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.seq_norm(hidden_states)
+
+        if "attention_mask" in kwargs:
+            logging.warning_once(
+                f"{self.__class__} does not use attention mask, but it is provided. It will be ignored."
+            )
+            kwargs.pop("attention_mask")  # TTTMLP does not use attention mask
 
         # TTT Adaptation Layer
         hidden_states = self.self_adapt(
@@ -994,6 +1010,9 @@ class TTTMLPModel(TTTMLPPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if "attention_mask" in kwargs:
+            logging.warning_once(
+                f"{self.__class__} does not use attention mask, but it is provided. It will be ignored."
+            )
             kwargs.pop("attention_mask")  # TTTMLP does not use attention mask
 
         rope_start_pos = 0

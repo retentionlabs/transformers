@@ -61,6 +61,7 @@ from ..ttt_linear.modeling_ttt_linear import (
     TTTCausalConv1d,
     TTTMultiHeadLayerNorm,
     TTTDynamicLearningGate,
+    TTTAdaptiveLinear,
     TTTLinearMemory,
     TTTLinearCache,
     TTTLinearAdaptation,
@@ -94,8 +95,8 @@ class TTTMLPMemory(TTTLinearMemory):
     @property
     def struct_detail(self):
         return [
-            self.AdaptiveLinear(self.num_heads, self.head_dim, 4 * self.head_dim),
-            self.AdaptiveLinear(self.num_heads, 4 * self.head_dim, self.head_dim)
+            TTTAdaptiveLinear(self.num_heads, self.head_dim, 4 * self.head_dim),
+            TTTAdaptiveLinear(self.num_heads, 4 * self.head_dim, self.head_dim)
         ]
 
 
