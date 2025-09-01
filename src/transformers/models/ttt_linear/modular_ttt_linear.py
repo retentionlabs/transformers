@@ -401,45 +401,36 @@ class TTTDynamicLearningGate(nn.Module):
         # - make the scale factor learnable
         self.alpha = nn.Parameter(torch.zeros((self.chunk_size,)))
 
-        # [width, 1]
-        _ = nn.Linear(self.head_dim, 1, bias=True)
-        linear_weight_data, linear_bias_data = _.weight.data, _.bias.data
-        # prepending head dim -> [num_heads, width, 1]
+        # [head_dim, 1]
+        target_shape_per_head = (self.head_dim, 1)
+        linear_bias_data = nn.Linear(self.head_dim, 1, bias=True).bias.data
+        # prepending head dim -> [num_heads, head_dim, 1]
         self.theta = nn.Parameter(torch.stack(
-            [torch.normal(0, 0.02, size=linear_weight_data.shape) for _ in range(self.num_heads)],
+            [torch.normal(0, 0.02, size=target_shape_per_head) for _ in range(self.num_heads)],
             dim=0
         ))
         # [num_heads, 1]
         self.theta_bias = nn.Parameter(torch.stack(  # init bias to 0 following original JAX impl.
             [torch.zeros_like(linear_bias_data) for _ in range(self.num_heads)],
             dim=0
-        ))
+        ).unsqueeze(-1))
 
     def __repr__(self):
         return f"{self.__class__.__name__}(heads={self.num_heads}, head_dim={self.head_dim}, lr={self.adapt_base_lr})"
 
     def forward(self, x):
-        # [B, num_heads, num_mini_batch, mini_batch_size, 1]
-        learning_rate = torch.einsum("bnkc,hdc->bhnkd", x, self.theta) + self.theta_bias.reshape(
-            1, -1, 1, 1, 1
-        )
+        # [B, num_heads, mini_batch_size, 1]
+        learning_rate = torch.einsum("bhkc,hcd->bhkd", x, self.theta) + self.theta_bias.view(1, self.num_heads, 1, 1)
         learning_rate = F.sigmoid(learning_rate)
-
-        # [B, num_heads, num_mini_batch, 1, mini_batch_size]
-        learning_rate = learning_rate.permute(0, 1, 2, 4, 3)
         learning_rate_eta = self.adapt_base_lr * learning_rate / self.head_dim
 
         # [B, L]
         token_idx = self.token_idx + self.alpha
-        # token idx should be greater than 0
-        token_idx = torch.clamp_min(token_idx, 0.0)
+        token_idx = torch.clamp_min(token_idx, 0.0)  # token idx should be greater than 0
 
         # NOTE: token_eta is a scale factor that applies to each token in the mini-batch
-        # [B, num_heads, num_mini_batch, mini_batch_size, 1]
-        token_eta = torch.broadcast_to(
-            token_idx.reshape(1, 1, 1, self.chunk_size, 1),
-            (x.shape[0], self.num_heads, x.shape[1], self.chunk_size, 1),
-        )
+        # [B, num_heads, mini_batch_size, 1]
+        token_eta = token_idx.view(1, 1, self.chunk_size, 1)
 
         return token_eta, learning_rate_eta
 
@@ -751,17 +742,19 @@ class TTTLinearAdaptation(nn.Module):
         _, reconstructed = carry(XK_mini_batch, output_hidden_states=True)
         reconstructed.insert(0, XK_mini_batch)
         reconstruction_target = XV_mini_batch
-        # [B,nh,K,f]
+        # [B,h,K,1], [B,h,K,1]
         token_eta, lr_eta = carry.lr_gate(XK_mini_batch)
-        eta = token_eta * lr_eta
-        gradients = carry.backward(reconstructed, reconstruction_target, eta=eta)
+        eta_scalar = token_eta * lr_eta  # [B,h,K,1] * [B,h,K,1] -> [B,h,K,1] for backward
+        eta_matrix = token_eta @ lr_eta.transpose(-2, -1)  # [B,h,K,1] @ [B,h,K,1] -> [B,h,K,K] for hidden state update
+        gradients = carry.backward(reconstructed, reconstruction_target, eta=eta_scalar)
 
         # Generate Hidden States
         hidden_states = XQ_mini_batch
         for idx, (val, gradient) in enumerate(zip(reconstructed, gradients)):
             attention_mask = torch.tril(hidden_states @ val.transpose(-2, -1))  # [B,nh,K,K]
             # [B,nh,K,f] @ [B,nh,f,f] + [B,nh,K,f] - ([B,nh,K,K] * [B,nh,K,K]) @ [B,nh,K,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
-            hidden_states = carry[idx](hidden_states) - (eta * attention_mask + torch.tril(eta)) @ gradient
+            update_term = (eta_matrix * attention_mask + torch.tril(eta_matrix)) @ gradient
+            hidden_states = carry[idx](hidden_states) - update_term
             if idx < carry.depth - 1:
                 hidden_states = carry.activate(hidden_states)
         hidden_states = XQ_mini_batch + carry.norm(hidden_states)  # residual connection
