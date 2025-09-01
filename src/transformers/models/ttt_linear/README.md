@@ -35,22 +35,20 @@ pip install "transformers[torch]"
 Our implementation is based on Huggingface Transformers. You can use the following code to load the model and generate text.
 
 ```python
-from transformers import AutoTokenizer
-from ttt import TTTForCausalLM, TTTConfig, TTT_STANDARD_CONFIGS
+from transformers import AutoTokenizer, TTTLinearConfig, TTTLinearForCausalLM
 
-# Initializing a TTT ttt-1b style configuration
-# configuration = TTTConfig(**TTT_STANDARD_CONFIGS['1b']) is equivalent to the following
-configuration = TTTConfig()
+# Initializing 8b style configuration
+configuration = TTTLinearConfig()
 
-# Initializing a model from the ttt-1b style configuration
-model = TTTForCausalLM(configuration)
+# Initializing a model from the 8b style configuration
+model = TTTLinearForCausalLM(configuration)
 model.eval()
 
 # Accessing the model configuration
 configuration = model.config
 
 # Tokenizer
-tokenizer = AutoTokenizer.from_pretrained('meta-llama/Llama-2-7b-hf')
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
 
 # Prefill
 input_ids = tokenizer("Greeting from TTT!", return_tensors="pt").input_ids
