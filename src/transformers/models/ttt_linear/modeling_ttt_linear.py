@@ -294,18 +294,20 @@ class TTTDynamicLearningGate(nn.Module):
         return f"{self.__class__.__name__}(heads={self.num_heads}, head_dim={self.head_dim}, lr={self.adapt_base_lr})"
 
     def forward(self, x):
+        current_mini_batch_size = x.shape[-2]
+
         # [B, num_heads, mini_batch_size, 1]
         learning_rate = torch.einsum("bhkc,hcd->bhkd", x, self.theta) + self.theta_bias.view(1, self.num_heads, 1, 1)
         learning_rate = F.sigmoid(learning_rate)
         learning_rate_eta = self.adapt_base_lr * learning_rate / self.head_dim
 
         # [K]
-        token_idx = self.token_idx + self.alpha
+        token_idx = self.token_idx[:current_mini_batch_size] + self.alpha[:current_mini_batch_size]
         token_idx = torch.clamp_min(token_idx, 0.0)  # token idx should be greater than 0
 
         # NOTE: token_eta is a scale factor that applies to each token in the mini-batch
         # [1, 1, K, 1], auto-broadcastable to [B, H, K, 1]
-        token_eta = token_idx.view(1, 1, self.chunk_size, 1)
+        token_eta = token_idx.view(1, 1, current_mini_batch_size, 1)
 
         return token_eta, learning_rate_eta
 
