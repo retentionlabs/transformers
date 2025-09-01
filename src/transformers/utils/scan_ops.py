@@ -6,12 +6,11 @@ from typing import Callable, Optional
 import warnings
 
 import torch
-from torch._dynamo.polyfills import pytree
+import torch.utils._pytree as pytree
 from torch.utils.checkpoint import checkpoint
 from torch._higher_order_ops import scan, associative_scan  # for future use
 
 
-@torch.compile(mode="max-autotune")
 def scan(
     combine_fn: Callable[
         [pytree.PyTree, pytree.PyTree], tuple[pytree.PyTree, pytree.PyTree]
@@ -478,70 +477,5 @@ def associative_scan(
         return tree.unflatten_as(sequence_template, scanned_tensors)
 
 
-class MemoryOperator:
-    """
-    Enhanced memory operator for neural networks
-    Supports gradient-based learning with momentum and forgetting
-    """
-
-    def __init__(
-        self, learning_rate: float = 0.01, momentum: float = 0.9,
-        decay_rate: float = 0.001, surprise_threshold: float = 0.1
-    ):
-        self.learning_rate = learning_rate
-        self.momentum = momentum
-        self.decay_rate = decay_rate
-        self.surprise_threshold = surprise_threshold
-
-    def __call__(self, prev_memory: Any, current_input: Any) -> Any:
-        """
-        Apply neural memory update with adaptive learning
-
-        Implements simplified version of memory update mechanism:
-        - Surprise-based attention weighting
-        - Momentum for stable learning
-        - Decay for forgetting irrelevant information
-        """
-        if isinstance(prev_memory, dict) and isinstance(current_input, dict):
-            return self._update_structured_memory(prev_memory, current_input)
-        else:
-            return self._update_tensor_memory(prev_memory, current_input)
-
-    def _update_structured_memory(self, prev_state: dict, new_input: dict) -> dict:
-        """Update structured memory (PyTree format)"""
-        updated_memory = {}
-
-        for key in prev_state.keys():
-            if key in new_input:
-                # Compute surprise metric (simplified)
-                prev_val = prev_state[key]
-                curr_val = new_input[key]
-
-                surprise = torch.norm(curr_val - prev_val, dim=-1, keepdim=True)
-                surprise_weight = torch.sigmoid(surprise - self.surprise_threshold)
-
-                # Apply forgetting through decay
-                decayed_memory = prev_val * (1 - self.decay_rate)
-
-                # Momentum-based update
-                update_signal = self.learning_rate * curr_val * surprise_weight
-                updated_memory[key] = decayed_memory + self.momentum * update_signal
-            else:
-                # Pure decay for missing inputs
-                updated_memory[key] = prev_state[key] * (1 - self.decay_rate)
-
-        return updated_memory
-
-    def _update_tensor_memory(
-        self, prev_tensor: torch.Tensor, new_tensor: torch.Tensor
-    ) -> torch.Tensor:
-        """Update simple tensor memory"""
-        # Surprise-based weighting
-        surprise = torch.norm(new_tensor - prev_tensor, dim=-1, keepdim=True)
-        surprise_weight = torch.sigmoid(surprise - self.surprise_threshold)
-
-        # Memory update with decay and momentum
-        decayed_prev = prev_tensor * (1 - self.decay_rate)
-        weighted_update = self.learning_rate * new_tensor * surprise_weight
-
-        return decayed_prev + self.momentum * weighted_update
+# Scan function is recommended to be compiled for better performance
+compiled_scan = torch.compile(scan, mode="max-autotune")
