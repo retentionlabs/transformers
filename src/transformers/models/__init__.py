@@ -319,6 +319,8 @@ if TYPE_CHECKING:
     from .timm_backbone import *
     from .timm_wrapper import *
     from .trocr import *
+    from .ttt_linear import *
+    from .ttt_mlp import *
     from .tvp import *
     from .udop import *
     from .umt5 import *
