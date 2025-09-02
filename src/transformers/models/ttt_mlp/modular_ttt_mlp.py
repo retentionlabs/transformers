@@ -110,6 +110,7 @@ class TTTMLPAdaptation(TTTLinearAdaptation):
 
 class TTTMLPLayer(TTTLinearLayer):
     def __init__(self, config: TTTMLPConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
         self.hidden_size = config.hidden_size
         self.pre_conv = config.pre_conv
 
