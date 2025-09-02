@@ -337,9 +337,9 @@ class TTTAdaptiveLinear(nn.Module):
                 output += self.bias
             return output
         else:
-            output = x @ self.weight_fast.to(x.device)
+            output = x @ self.weight_fast
             if self.use_bias:
-                output += self.bias_fast.to(x.device)
+                output += self.bias_fast
             return output
 
     def detach(self, batch_size: int):
@@ -491,6 +491,8 @@ class TTTLinearMemory(nn.Module):
             backward_grads.insert(0, grad_n)
 
         mini_batch_size = reconstructed[0].shape[-2]
+        # NOTE: The length of 'reconstructed' list is may larger (+1) than the others,
+        #       but not sliced to avoid redundant operation (zip will stop iterate automatically)
         for fwd, layer, grad in zip(reconstructed, self.layers, backward_grads):
             if self.chunk_size == mini_batch_size:  # Use Dual Form
                 # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
@@ -827,8 +829,8 @@ class TTTLinearLayer(nn.Module):
         hidden_states = self.seq_norm(hidden_states)
 
         if "attention_mask" in kwargs:
-            logging.warning_once(
-                f"{self.__class__} does not use attention mask, but it is provided. It will be ignored."
+            logger.warning_once(
+                f"{self.__class__.__name__} does not use attention mask, but it is provided. It will be ignored."
             )
             kwargs.pop("attention_mask")  # TTTLinear does not use attention mask
 
@@ -999,8 +1001,8 @@ class TTTLinearModel(TTTLinearPreTrainedModel):
             )
 
         if "attention_mask" in kwargs:
-            logging.warning_once(
-                f"{self.__class__} does not use attention mask, but it is provided. It will be ignored."
+            logger.warning_once(
+                f"{self.__class__.__name__} does not use attention mask, but it is provided. It will be ignored."
             )
             kwargs.pop("attention_mask")  # TTTLinear does not use attention mask
 
