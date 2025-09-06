@@ -55,15 +55,15 @@ from ...modeling_layers import (
 )
 from ..ttt_linear.configuration_ttt_linear import TTTLinearConfig
 from ..ttt_linear.modeling_ttt_linear import (
+    TTTLinearCache,
     TTTRMSNorm,
     TTTSwiGluMLP,
     TTTRotaryEmbedding,
-    TTTCausalConv1d,
-    TTTMultiHeadLayerNorm,
+    TTTMultiheadLayerNorm,
     TTTDynamicLearningGate,
-    TTTAdaptiveLinear,
-    TTTLinearMemory,
-    TTTLinearCache,
+    TTTMultiheadLinearMixin,
+    TTTMultiheadLinear,
+    TTTLinearAdaptationState,
     TTTLinearAdaptation,
     TTTLinearLayer,
     TTTLinearPreTrainedModel,
@@ -74,30 +74,72 @@ from ..ttt_linear.modeling_ttt_linear import (
     TTTLinearForImageClassification
 )
 
-from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
-from ...utils.import_utils import is_causal_conv1d_available
-if is_causal_conv1d_available():
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-else:
-    causal_conv1d_update, causal_conv1d_fn = None, None
+from ...utils import logging
 
 
 logger = logging.get_logger(__name__)
 
 
 class TTTMLPConfig(TTTLinearConfig):
-    pass
+    model_type = "ttt_mlp"
 
+    def __init__(
+        self,
+        vocab_size=32000,
+        hidden_size=4096,
+        intermediate_size=11008,
+        num_hidden_layers=40,
+        num_attention_heads=32,
+        hidden_act="silu",
+        max_position_embeddings=4096,
+        initializer_range=0.02,
+        rms_norm_eps=1e-6,
+        mini_batch_eps=1e-6,
+        use_cache=False,
+        pad_token_id=None,
+        bos_token_id=1,
+        eos_token_id=2,
+        pretraining_tp=1,
+        tie_word_embeddings=True,
+        rope_theta=10000.0,
+        rope_scaling=None,
+        mlp_bias=False,
+        adapt_base_lr=1.0,
+        chunk_size=16,
+        qkv_conv=False,
+        conv_kernel=4,
+        scan_checkpoint_group_size=0,
+        **kwargs,
+    ):
+        super().__init__(
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=num_attention_heads,
+            hidden_act=hidden_act,
+            max_position_embeddings=max_position_embeddings,
+            initializer_range=initializer_range,
+            rms_norm_eps=rms_norm_eps,
+            mini_batch_eps=mini_batch_eps,
+            use_cache=use_cache,
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            pretraining_tp=pretraining_tp,
+            tie_word_embeddings=tie_word_embeddings,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            mlp_bias=mlp_bias,
+            adapt_base_lr=adapt_base_lr,
+            chunk_size=chunk_size,
+            qkv_conv=qkv_conv,
+            conv_kernel=conv_kernel,
+            scan_checkpoint_group_size=scan_checkpoint_group_size,
+            **kwargs,
+        )
 
-class TTTMLPMemory(TTTLinearMemory):
-    depth = 2
-
-    @property
-    def struct_detail(self):
-        return [
-            TTTAdaptiveLinear(self.num_heads, self.head_dim, 4 * self.head_dim),
-            TTTAdaptiveLinear(self.num_heads, 4 * self.head_dim, self.head_dim)
-        ]
+        self.memory_depth = 2  # TTTMLPAdaptation depth
 
 
 class TTTMLPCache(TTTLinearCache):
@@ -105,20 +147,22 @@ class TTTMLPCache(TTTLinearCache):
 
 
 class TTTMLPAdaptation(TTTLinearAdaptation):
-    memory_class = TTTMLPMemory
+
+    @staticmethod
+    def struct_details(num_heads: int, head_dim: int):
+        return [
+            dict(num_heads=num_heads, in_features=head_dim, out_features=4*head_dim),
+            dict(num_heads=num_heads, in_features=4*head_dim, out_features=head_dim)
+        ]
 
 
 class TTTMLPLayer(TTTLinearLayer):
     def __init__(self, config: TTTMLPConfig, layer_idx: int):
         super().__init__(config, layer_idx)
         self.hidden_size = config.hidden_size
-        self.pre_conv = config.pre_conv
 
         self.self_adapt = TTTMLPAdaptation(config=config, layer_idx=layer_idx)
-
         self.mlp = TTTSwiGluMLP(config)
-        if self.pre_conv:
-            self.conv = TTTCausalConv1d(config, layer_idx)
 
         self.seq_norm = TTTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = TTTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
