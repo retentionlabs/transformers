@@ -231,6 +231,7 @@ class TTTDynamicLearningGate(nn.Module):
 
 class TTTMultiheadLinearMixin:
     def __init__(self):
+        super().__init__()  # To follow MRO
         self.use_bias = None
         self.weight = None
         self.bias = None
@@ -482,7 +483,7 @@ class TTTMLPAdaptation(nn.Module):
         self.v_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
 
-        if config.qkv_conv:  # depthwise conv
+        if self.qkv_conv:  # depthwise conv
             self.conv_q = nn.Conv1d(
                 self.head_dim,
                 self.head_dim,
@@ -611,7 +612,7 @@ class TTTMLPAdaptation(nn.Module):
         XV = self.v_proj(hidden_states).reshape(B, L, num_heads, head_dim).transpose(1, 2)
 
         # QKV Post Convolution
-        if self.use_conv:
+        if self.qkv_conv:
             XQ = self.conv_q(XQ)  # local pattern
             XK = self.conv_k(XK)  # key representation
             XV = self.conv_v(XV)  # value representation
@@ -667,9 +668,9 @@ class TTTMLPAdaptation(nn.Module):
             self.chunk_size,
             self.num_heads,
             self.head_dim,
-            self.neural_memory.layers,
-            self.neural_memory.norm,
-            self.neural_memory.lr_gate,
+            self.neural_memory,
+            self.shared_norm,
+            self.lr_gate,
         )
 
 
