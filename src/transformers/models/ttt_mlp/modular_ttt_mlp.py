@@ -85,10 +85,10 @@ class TTTMLPConfig(TTTLinearConfig):
 
     def __init__(
         self,
-        vocab_size=32000,
-        hidden_size=4096,
-        intermediate_size=11008,
-        num_hidden_layers=40,
+        vocab_size=151936,
+        hidden_size=2048,
+        intermediate_size=5504,
+        num_hidden_layers=24,
         num_attention_heads=32,
         hidden_act="silu",
         max_position_embeddings=4096,
