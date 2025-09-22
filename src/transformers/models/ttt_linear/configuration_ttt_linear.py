@@ -146,8 +146,6 @@ class TTTLinearConfig(PretrainedConfig):
                     Only used with 'llama3'. Scaling factor applied to high frequency components of the RoPE
         adapt_base_lr (`float`, *optional*, defaults to 1.0): base learning rate for TTT learner
         chunk_size (`int`, *optional*, defaults to 16): chunk size (mini-batch size) for TTT learner
-        qkv_conv (`bool`, *optional*, defaults to `False`): Whether the model use conv while qkv projection
-        conv_kernel (`int`, *optional*, defaults to 4): kernel size of the conv layer
         scan_checkpoint_group_size (`int`, *optional*, defaults to 0):
             gradient checkpoint group size on seq dimension, 0 means no checkpointing.
             In JAX implementation, we set it 4, which means we group 4 chunks together in 1 gradient checkpointg to save memory.
@@ -190,8 +188,6 @@ class TTTLinearConfig(PretrainedConfig):
         mlp_bias=False,
         adapt_base_lr=1.0,
         chunk_size=16,
-        qkv_conv=False,
-        conv_kernel=4,
         scan_checkpoint_group_size=0,
         **kwargs,
     ):
@@ -215,8 +211,6 @@ class TTTLinearConfig(PretrainedConfig):
         self.adapt_base_lr = adapt_base_lr
         self.chunk_size = chunk_size
 
-        self.qkv_conv = qkv_conv
-        self.conv_kernel = conv_kernel
         self.scan_checkpoint_group_size = scan_checkpoint_group_size
 
         self.memory_depth = 1  # TTTLinearAdaptation depth

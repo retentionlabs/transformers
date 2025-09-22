@@ -106,8 +106,6 @@ class TTTMLPConfig(TTTLinearConfig):
         mlp_bias=False,
         adapt_base_lr=1.0,
         chunk_size=16,
-        qkv_conv=False,
-        conv_kernel=4,
         scan_checkpoint_group_size=0,
         **kwargs,
     ):
@@ -133,8 +131,6 @@ class TTTMLPConfig(TTTLinearConfig):
             mlp_bias=mlp_bias,
             adapt_base_lr=adapt_base_lr,
             chunk_size=chunk_size,
-            qkv_conv=qkv_conv,
-            conv_kernel=conv_kernel,
             scan_checkpoint_group_size=scan_checkpoint_group_size,
             **kwargs,
         )
@@ -227,7 +223,7 @@ class TTTMLPForImageClassification(TTTLinearForImageClassification):
 
 __all__ = [
     "TTTMLPConfig",
-    "TTTMLPMemory",
+    "TTTMLPCache",
     "TTTMLPAdaptation",
     "TTTMLPLayer",
     "TTTMLPPreTrainedModel",

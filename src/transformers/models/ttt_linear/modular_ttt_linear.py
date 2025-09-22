@@ -179,8 +179,6 @@ class TTTLinearConfig(PretrainedConfig):
                     Only used with 'llama3'. Scaling factor applied to high frequency components of the RoPE
         adapt_base_lr (`float`, *optional*, defaults to 1.0): base learning rate for TTT learner
         chunk_size (`int`, *optional*, defaults to 16): chunk size (mini-batch size) for TTT learner
-        qkv_conv (`bool`, *optional*, defaults to `False`): Whether the model use conv while qkv projection
-        conv_kernel (`int`, *optional*, defaults to 4): kernel size of the conv layer
         scan_checkpoint_group_size (`int`, *optional*, defaults to 0):
             gradient checkpoint group size on seq dimension, 0 means no checkpointing.
             In JAX implementation, we set it 4, which means we group 4 chunks together in 1 gradient checkpointg to save memory.
@@ -223,8 +221,6 @@ class TTTLinearConfig(PretrainedConfig):
         mlp_bias=False,
         adapt_base_lr=1.0,
         chunk_size=16,
-        qkv_conv=False,
-        conv_kernel=4,
         scan_checkpoint_group_size=0,
         **kwargs,
     ):
@@ -248,8 +244,6 @@ class TTTLinearConfig(PretrainedConfig):
         self.adapt_base_lr = adapt_base_lr
         self.chunk_size = chunk_size
 
-        self.qkv_conv = qkv_conv
-        self.conv_kernel = conv_kernel
         self.scan_checkpoint_group_size = scan_checkpoint_group_size
 
         self.memory_depth = 1  # TTTLinearAdaptation depth
@@ -276,8 +270,7 @@ class TTTLinearCache:
 
     Parameters:
         config (`PretrainedConfig`):
-            The model configuration, used to infer hyperparameters like the number of layers, hidden size,
-            and convolution settings.
+            The model configuration, used to infer hyperparameters like the number of layers, hidden size settings.
         batch_size (`int`):
             The number of sequences in the input batch. The cache tensors will be initialized with this
             batch dimension.
@@ -288,11 +281,9 @@ class TTTLinearCache:
             The device (e.g., "cuda" or "cpu") on which the cache tensors will be allocated.
 
     Attributes:
-        state_params_dict (`dict`):
+        state_dict (`dict`):
             The core data store for the fast weights. It's a nested dictionary with the structure:
-            `{"parameter_name_states/grad": {layer_idx: tensor}}`.
-        conv_states_dict (`dict`):
-            A dictionary that holds the states for the convolutional layers, if they are enabled in the config.
+            `{"parameter_name": {layer_idx: tensor}}`.
     """
     layer_list_key = "self_adapt"
 
@@ -303,7 +294,6 @@ class TTTLinearCache:
 
         self.token_len = 0
         self.state_dict = defaultdict(dict)
-        self.conv_states_dict = defaultdict(dict)
         logger.info(f"Creating cache of size: {batch_size}")
 
         for layer_idx in range(config.num_hidden_layers):
@@ -324,7 +314,6 @@ class TTTLinearCache:
 
     def __getitem__(self, layer_idx):
         return {name: self.state_dict[name][layer_idx] for name in self.state_dict}
-
 
 
 class TTTRMSNorm(LlamaRMSNorm):
@@ -660,27 +649,11 @@ class TTTLinearAdaptation(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = self.width // self.num_heads
         self.chunk_size = config.chunk_size
-        self.conv_kernel = config.conv_kernel
-        self.qkv_conv = config.qkv_conv
 
         self.q_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
-
-        if self.qkv_conv:  # depthwise conv
-            self.conv_q = nn.Conv1d(
-                self.head_dim, self.head_dim, groups=self.head_dim, bias=False,
-                kernel_size=config.conv_kernel, padding=config.conv_kernel // 2  # same padding for non-causal conv
-            )
-            self.conv_k = nn.Conv1d(
-                self.head_dim, self.head_dim, groups=self.head_dim, bias=False,
-                kernel_size=config.conv_kernel, padding=config.conv_kernel // 2
-            )
-            self.conv_v = nn.Conv1d(
-                self.head_dim, self.head_dim, groups=self.head_dim, bias=False,
-                kernel_size=config.conv_kernel, padding=config.conv_kernel // 2
-            )
 
         self.lr_gate = TTTDynamicLearningGate(
             self.num_heads, self.head_dim,
@@ -784,12 +757,6 @@ class TTTLinearAdaptation(nn.Module):
         XQ = self.q_proj(hidden_states).reshape(B, L, num_heads, head_dim).transpose(1, 2)
         XK = self.k_proj(hidden_states).reshape(B, L, num_heads, head_dim).transpose(1, 2)
         XV = self.v_proj(hidden_states).reshape(B, L, num_heads, head_dim).transpose(1, 2)
-
-        # QKV Post Convolution
-        if self.qkv_conv:
-            XQ = self.conv_q(XQ)  # local pattern
-            XK = self.conv_k(XK)  # key representation
-            XV = self.conv_v(XV)  # value representation
 
         # RoPE
         cos, sin = position_embeddings
