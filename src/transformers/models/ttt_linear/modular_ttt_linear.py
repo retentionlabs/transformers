@@ -299,8 +299,9 @@ class TTTLinearCache:
         for layer_idx in range(config.num_hidden_layers):
             for name in self.param_names:
                 _, memory_idx, memory_type = name.split(".")
+                memory_idx = int(memory_idx)
                 seq_modeling_layer = getattr(layers[layer_idx], self.layer_list_key)
-                weight = getattr(seq_modeling_layer.neural_memory.layers[memory_idx], memory_type)
+                weight = getattr(seq_modeling_layer.neural_memory[memory_idx], memory_type)
 
                 tiled_weight = torch.tile(weight.unsqueeze(0), (batch_size,) + (1,) * weight.dim()).to(device)
                 self.state_dict[name][layer_idx] = tiled_weight
